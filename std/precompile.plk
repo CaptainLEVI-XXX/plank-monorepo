@@ -1,0 +1,93 @@
+import std::error::require;
+import std::membytes::{membytes, membytes_from_ptr};
+import std::option::{Option, Some, None};
+
+const ECRECOVER_ADDR = 0x01;
+const SHA256_ADDR = 0x02;
+const RIPEMD160_ADDR = 0x03;
+const IDENTITY_ADDR = 0x04;
+const MODEXP_ADDR = 0x05;
+
+const ecrecover = fn (hash: u256, v: u256, r: u256, s: u256) Option(u256) {
+    let len = 128;
+    let buf = @malloc_uninit(len);
+    @mstore32(buf +% 0, hash);
+    @mstore32(buf +% 32, v);
+    @mstore32(buf +% 64, r);
+    @mstore32(buf +% 96, s);
+
+    let success = @evm_staticcall(
+        @evm_gas(), 
+        ECRECOVER_ADDR, 
+        buf, 
+        len, 
+        buf,
+        32
+    );
+    
+    if success {
+        Some(u256, @mload32(buf))
+    } else {
+        None(u256)
+    }
+
+};
+
+const sha256 = fn (data: membytes) u256 {
+    let len = 32;
+    let buf = @malloc_uninit(len);
+
+    let success = @evm_staticcall(
+        @evm_gas(), 
+        SHA256_ADDR, 
+        data.ptr, 
+        data.len, 
+        buf, 
+        len 
+    );
+    require(success);
+
+    @mload32(buf)
+};
+
+const ripemd160 = fn (data: membytes) u256 {
+    let len = 32;
+    let buf = @malloc_uninit(len);
+
+    let success = @evm_staticcall(
+        @evm_gas(), 
+        RIPEMD160_ADDR, 
+        data.ptr, 
+        data.len, 
+        buf,
+        len,
+    );
+    require(success);
+
+    @mload32(buf)
+};
+
+const modexp = fn (base: membytes, exp: membytes, mod: membytes) membytes {
+    let len = 96 + base.len + exp.len + mod.len;
+    let buf = @malloc_uninit(len);
+
+    @mstore32(buf +% 0, base.len);
+    @mstore32(buf +% 32, exp.len);
+    @mstore32(buf +% 64, mod.len);
+
+    @mcopy(buf +% 96, base.ptr, base.len);
+    @mcopy(buf +% 96 +% base.len, exp.ptr, exp.len);
+    @mcopy(buf +% 96 +% base.len +% exp.len, mod.ptr, mod.len);
+
+    let success = @evm_staticcall(
+        @evm_gas(), 
+        MODEXP_ADDR, 
+        buf, 
+        len, 
+        buf, 
+        mod.len 
+    );
+    require(success);
+
+    membytes_from_ptr(buf, mod.len) 
+};

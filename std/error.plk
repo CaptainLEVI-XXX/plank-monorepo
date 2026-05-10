@@ -1,5 +1,5 @@
-const require = fn (cond: bool) void {
-    if !cond {
+const require = fn (condition: bool) void {
+    if !condition {
         @evm_revert(@malloc_uninit(0), 0);
     }
 };
