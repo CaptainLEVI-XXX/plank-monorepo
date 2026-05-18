@@ -1,4 +1,5 @@
 use hashbrown::HashMap;
+use plank_core::LoopLimit;
 
 use crate::analyses::{AnalysesMask, ControlFlowGraphInOutBundling, Dominators, InOutGroupId};
 use sir_data::{
@@ -11,15 +12,22 @@ use crate::{AnalysesStore, Pass};
 #[derive(Default)]
 pub struct CopyPropagation {
     copy_map: HashMap<LocalId, LocalId>,
-    io_groups: Vec<InOutGroupBlocks>,
+    raw_map: HashMap<LocalId, LocalId>,
+    canonical_map: HashMap<LocalId, LocalId>,
+    io_groups: IndexVec<InOutGroupId, InOutGroupBlocks>,
     def_blocks: IndexVec<LocalId, Option<BasicBlockId>>,
     function_entries: IndexVec<BasicBlockId, bool>,
-    slots_to_remove: Vec<Vec<bool>>,
+    slots_to_remove: IndexVec<InOutGroupId, Vec<bool>>,
+    candidates: Vec<RemovalCandidate>,
+    inserted_inputs: Vec<LocalId>,
+    seen_locals: Vec<LocalId>,
 }
 
 impl Pass for CopyPropagation {
     fn run(&mut self, program: &mut EthIRProgram, store: &AnalysesStore) {
+        let mut limit = LoopLimit::new();
         loop {
+            limit.tick();
             self.propagate_operation_copies(program);
             if !self.propagate_input_output_copies(program, store) {
                 break;
@@ -76,10 +84,11 @@ impl CopyPropagation {
         self.build_in_out_groups(program, store);
         let dominators = store.dominators(program);
 
-        let mut raw_map = HashMap::new();
-        let mut candidates = Vec::new();
+        self.raw_map.clear();
+        self.candidates.clear();
 
-        for (group_idx, group) in self.io_groups.iter().enumerate() {
+        for group_id in self.io_groups.iter_idx() {
+            let group = &self.io_groups[group_id];
             if group.inputs.is_empty() || group.outputs.is_empty() {
                 continue;
             }
@@ -102,24 +111,29 @@ impl CopyPropagation {
                     continue;
                 }
 
-                let Some(input_locals) =
-                    try_add_slot_replacements(program, group, slot, replacement, &mut raw_map)
-                else {
+                let Some(input_locals) = try_add_slot_replacements(
+                    program,
+                    group,
+                    slot,
+                    replacement,
+                    &mut self.raw_map,
+                    &mut self.inserted_inputs,
+                ) else {
                     continue;
                 };
 
-                if !input_locals.is_empty() {
-                    candidates.push(RemovalCandidate { group_idx, slot, input_locals });
+                if input_locals {
+                    self.candidates.push(RemovalCandidate { group: group_id, slot, replacement });
                 }
             }
         }
 
-        if raw_map.is_empty() {
+        if self.raw_map.is_empty() {
             return false;
         }
 
-        let canonical_map = canonicalized_copy_map(&raw_map);
-        if canonical_map.is_empty() {
+        self.canonicalize_raw_map();
+        if self.canonical_map.is_empty() {
             return false;
         }
 
@@ -127,29 +141,30 @@ impl CopyPropagation {
         if self.slots_to_remove.len() < self.io_groups.len() {
             self.slots_to_remove.resize_with(self.io_groups.len(), Vec::new);
         }
-        for remove in &mut self.slots_to_remove {
+        for remove in self.slots_to_remove.iter_mut() {
             remove.clear();
         }
 
         let mut changed = false;
-        for candidate in &candidates {
+        for candidate_idx in 0..self.candidates.len() {
+            let candidate = self.candidates[candidate_idx];
             let Some(replacement) =
-                self.candidate_final_replacement(&dominators, candidate, &canonical_map)
+                self.candidate_final_replacement(program, &dominators, candidate)
             else {
                 continue;
             };
 
-            for &input in &candidate.input_locals {
-                let prev = self.copy_map.insert(input, replacement);
-                debug_assert!(
-                    prev.is_none_or(|prev| prev == replacement),
-                    "conflicting replacement for ${input}"
-                );
-            }
+            insert_candidate_replacements(
+                program,
+                &self.io_groups[candidate.group],
+                candidate,
+                replacement,
+                &mut self.copy_map,
+            );
 
-            let group = &self.io_groups[candidate.group_idx];
+            let group = &self.io_groups[candidate.group];
             let slots = program.basic_blocks[group.outputs[0]].outputs.len() as usize;
-            let remove = &mut self.slots_to_remove[candidate.group_idx];
+            let remove = &mut self.slots_to_remove[candidate.group];
             if remove.len() != slots {
                 remove.clear();
                 remove.resize(slots, false);
@@ -199,8 +214,13 @@ impl CopyPropagation {
     fn build_in_out_groups(&mut self, program: &EthIRProgram, store: &AnalysesStore) {
         let bundling = ControlFlowGraphInOutBundling::new(program, store);
 
-        self.io_groups.clear();
-        self.io_groups.resize_with(bundling.total_groups() as usize, InOutGroupBlocks::default);
+        let total_groups = bundling.total_groups() as usize;
+        if self.io_groups.len() < total_groups {
+            self.io_groups.resize_with(total_groups, InOutGroupBlocks::default);
+        }
+        for group in self.io_groups.iter_mut() {
+            group.clear();
+        }
 
         for bb_id in program.basic_blocks.iter_idx() {
             if let Some(group) = bundling.get_in_group(bb_id) {
@@ -213,7 +233,7 @@ impl CopyPropagation {
     }
 
     fn group_mut(&mut self, group: InOutGroupId) -> &mut InOutGroupBlocks {
-        &mut self.io_groups[group.idx()]
+        &mut self.io_groups[group]
     }
 
     fn replacement_is_available_at_inputs(
@@ -231,15 +251,20 @@ impl CopyPropagation {
 
     fn candidate_final_replacement(
         &self,
+        program: &EthIRProgram,
         dominators: &Dominators,
-        candidate: &RemovalCandidate,
-        canonical_map: &HashMap<LocalId, LocalId>,
+        candidate: RemovalCandidate,
     ) -> Option<LocalId> {
-        let group = &self.io_groups[candidate.group_idx];
+        let group = &self.io_groups[candidate.group];
         let mut final_replacement = None;
 
-        for &input in &candidate.input_locals {
-            let &replacement = canonical_map.get(&input)?;
+        for &bb_id in &group.inputs {
+            let input = local_at_slot(program, program.basic_blocks[bb_id].inputs, candidate.slot);
+            if input == candidate.replacement {
+                continue;
+            }
+
+            let &replacement = self.canonical_map.get(&input)?;
             match final_replacement {
                 None => final_replacement = Some(replacement),
                 Some(existing) if existing == replacement => {}
@@ -252,8 +277,29 @@ impl CopyPropagation {
             .then_some(replacement)
     }
 
+    fn canonicalize_raw_map(&mut self) {
+        self.canonical_map.clear();
+
+        let raw_map = &self.raw_map;
+        let canonical_map = &mut self.canonical_map;
+        let seen_locals = &mut self.seen_locals;
+
+        for &key in raw_map.keys() {
+            let Some(resolved) = resolve_copy_target_from_snapshot(key, raw_map, seen_locals)
+            else {
+                continue;
+            };
+
+            if resolved != key {
+                canonical_map.insert(key, resolved);
+            }
+        }
+    }
+
     fn compact_removed_slots(&mut self, program: &mut EthIRProgram) {
-        for (group, remove) in self.io_groups.iter().zip(&self.slots_to_remove) {
+        for group_id in self.io_groups.iter_idx() {
+            let group = &self.io_groups[group_id];
+            let remove = &self.slots_to_remove[group_id];
             if !remove.iter().any(|&remove| remove) {
                 continue;
             }
@@ -284,10 +330,18 @@ struct InOutGroupBlocks {
     outputs: Vec<BasicBlockId>,
 }
 
+impl InOutGroupBlocks {
+    fn clear(&mut self) {
+        self.inputs.clear();
+        self.outputs.clear();
+    }
+}
+
+#[derive(Clone, Copy)]
 struct RemovalCandidate {
-    group_idx: usize,
+    group: InOutGroupId,
     slot: usize,
-    input_locals: Vec<LocalId>,
+    replacement: LocalId,
 }
 
 fn strictly_dominates(
@@ -299,7 +353,9 @@ fn strictly_dominates(
         return false;
     }
 
+    let mut limit = LoopLimit::new();
     while let Some(idom) = dominators.of(block) {
+        limit.tick();
         if idom == dominator {
             return true;
         }
@@ -348,9 +404,10 @@ fn try_add_slot_replacements(
     slot: usize,
     replacement: LocalId,
     raw_map: &mut HashMap<LocalId, LocalId>,
-) -> Option<Vec<LocalId>> {
-    let mut inserted = Vec::new();
-    let mut input_locals = Vec::new();
+    inserted: &mut Vec<LocalId>,
+) -> Option<bool> {
+    inserted.clear();
+    let mut has_replacements = false;
 
     for &bb_id in &group.inputs {
         let input = local_at_slot(program, program.basic_blocks[bb_id].inputs, slot);
@@ -358,7 +415,7 @@ fn try_add_slot_replacements(
             continue;
         }
 
-        input_locals.push(input);
+        has_replacements = true;
         match raw_map.get(&input).copied() {
             None => {
                 raw_map.insert(input, replacement);
@@ -366,7 +423,7 @@ fn try_add_slot_replacements(
             }
             Some(existing) if existing == replacement => {}
             Some(_) => {
-                for input in inserted {
+                for &input in inserted.iter() {
                     raw_map.remove(&input);
                 }
                 return None;
@@ -374,33 +431,20 @@ fn try_add_slot_replacements(
         }
     }
 
-    Some(input_locals)
-}
-
-fn canonicalized_copy_map(raw_map: &HashMap<LocalId, LocalId>) -> HashMap<LocalId, LocalId> {
-    let mut canonical = HashMap::with_capacity(raw_map.len());
-
-    for &key in raw_map.keys() {
-        let Some(resolved) = resolve_copy_target_from_snapshot(key, raw_map) else {
-            continue;
-        };
-
-        if resolved != key {
-            canonical.insert(key, resolved);
-        }
-    }
-
-    canonical
+    Some(has_replacements)
 }
 
 fn resolve_copy_target_from_snapshot(
     local: LocalId,
     snapshot: &HashMap<LocalId, LocalId>,
+    seen: &mut Vec<LocalId>,
 ) -> Option<LocalId> {
+    seen.clear();
     let mut current = local;
-    let mut seen = Vec::new();
 
+    let mut limit = LoopLimit::new();
     while let Some(&next) = snapshot.get(&current) {
+        limit.tick();
         if seen.contains(&current) {
             return None;
         }
@@ -410,6 +454,27 @@ fn resolve_copy_target_from_snapshot(
     }
 
     Some(current)
+}
+
+fn insert_candidate_replacements(
+    program: &EthIRProgram,
+    group: &InOutGroupBlocks,
+    candidate: RemovalCandidate,
+    replacement: LocalId,
+    copy_map: &mut HashMap<LocalId, LocalId>,
+) {
+    for &bb_id in &group.inputs {
+        let input = local_at_slot(program, program.basic_blocks[bb_id].inputs, candidate.slot);
+        if input == candidate.replacement {
+            continue;
+        }
+
+        let prev = copy_map.insert(input, replacement);
+        debug_assert!(
+            prev.is_none_or(|prev| prev == replacement),
+            "conflicting replacement for ${input}"
+        );
+    }
 }
 
 fn replace_uses(program: &mut EthIRProgram, copy_map: &HashMap<LocalId, LocalId>) {
