@@ -465,8 +465,9 @@ fn compact_span(
 #[cfg(test)]
 mod tests {
     use super::CopyPropagation;
-    use crate::run_pass_and_display;
+    use crate::{AnalysesStore, Legalizer, run_pass, run_pass_and_display};
     use sir_data::assert_ir_display;
+    use sir_parser::{EmitConfig, parse_or_panic};
 
     #[test]
     fn test_copy_chains_and_inline_operands() {
@@ -513,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_phi_nodes_block_propagation() {
+    fn test_input_output_copy_eliminates_block_argument() {
         let input = r#"
             fn init:
                 entry {
@@ -545,14 +546,14 @@ mod tests {
                     stop
                 }
 
-                @1 $0 -> $0 {
+                @1 $0 {
                     $1 = copy $0
                     $2 = copy $0
                     => @2
                 }
 
-                @2 $3 {
-                    $4 = add $3 $3
+                @2 {
+                    $4 = add $0 $0
                     stop
                 }
             "#,
@@ -716,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_map_does_not_leak_between_blocks() {
+    fn test_input_output_copy_chain_across_blocks() {
         let input = r#"
             fn init:
                 entry {
@@ -747,16 +748,455 @@ mod tests {
                     stop
                 }
 
-                @1 $0 -> $0 $0 {
+                @1 $0 {
                     $1 = copy $0
                     => @2
                 }
 
-                @2 $2 $3 {
-                    $4 = add $2 $3
+                @2 {
+                    $4 = add $0 $0
                     stop
                 }
             "#,
         );
+    }
+
+    #[test]
+    fn test_input_output_copy_chain_across_three_blocks() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                entry x -> x {
+                    => @middle
+                }
+                middle y -> y {
+                    => @next
+                }
+                next z {
+                    w = add z z
+                    stop
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 {
+                    => @2
+                }
+
+                @2 {
+                    => @3
+                }
+
+                @3 {
+                    $3 = add $0 $0
+                    stop
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_function_entry_input_is_preserved() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn callee:
+                entry x -> x {
+                    => @return
+                }
+                return y -> y {
+                    iret
+                }
+            fn caller:
+                entry a {
+                    out = icall @callee a
+                    stop
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 1)
+                fn @2 -> entry @3  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 {
+                    => @2
+                }
+
+                @2 -> $0 {
+                    iret
+                }
+
+                @3 $2 {
+                    $3 = icall @1 $2
+                    stop
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_branch_inputs_outputs_same_local_eliminated() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                entry x {
+                    => x ? @left : @right
+                }
+                left -> x {
+                    => @merge
+                }
+                right -> x {
+                    => @merge
+                }
+                merge y {
+                    z = add y y
+                    stop
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 {
+                    => $0 ? @2 : @3
+                }
+
+                @2 {
+                    => @4
+                }
+
+                @3 {
+                    => @4
+                }
+
+                @4 {
+                    $2 = add $0 $0
+                    stop
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_branch_inputs_outputs_different_locals_preserved() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                entry cond {
+                    => cond ? @left : @right
+                }
+                left -> a {
+                    a = const 1
+                    => @merge
+                }
+                right -> b {
+                    b = const 2
+                    => @merge
+                }
+                merge y {
+                    z = add y y
+                    stop
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 {
+                    => $0 ? @2 : @3
+                }
+
+                @2 -> $1 {
+                    $1 = const 0x1
+                    => @4
+                }
+
+                @3 -> $2 {
+                    $2 = const 0x2
+                    => @4
+                }
+
+                @4 $3 {
+                    $4 = add $3 $3
+                    stop
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_switch_inputs_outputs_same_local_eliminated() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                entry selector x {
+                    switch selector {
+                        0 => @left
+                        1 => @right
+                        default => @fallback
+                    }
+                }
+                left -> x {
+                    => @merge
+                }
+                right -> x {
+                    => @merge
+                }
+                fallback -> x {
+                    => @merge
+                }
+                merge y {
+                    z = add y y
+                    stop
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 $1 {
+                    switch $0 {
+                        0x0 => @2,
+                        0x1 => @3,
+                        else => @4
+                    }
+
+                }
+
+                @2 {
+                    => @5
+                }
+
+                @3 {
+                    => @5
+                }
+
+                @4 {
+                    => @5
+                }
+
+                @5 {
+                    $3 = add $1 $1
+                    stop
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_self_loop_input_output_is_preserved() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                loop i -> next {
+                    one = const 1
+                    next = add i one
+                    => @loop
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 -> $2 {
+                    $1 = const 0x1
+                    $2 = add $0 $1
+                    => @1
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_self_loop_same_input_output_is_preserved() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                loop i -> i {
+                    => @loop
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 -> $0 {
+                    => @1
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_two_block_loop_does_not_replace_header_input_with_backedge_input() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                entry i -> i {
+                    => @tail
+                }
+                tail j -> j {
+                    => @entry
+                }
+        "#;
+
+        let actual = run_pass_and_display::<CopyPropagation>(input);
+        assert_ir_display(
+            &actual,
+            r#"
+            Init: @0
+            Functions:
+                fn @0 -> entry @0  (outputs: 0)
+                fn @1 -> entry @1  (outputs: 0)
+
+            Basic Blocks:
+                @0 {
+                    stop
+                }
+
+                @1 $0 {
+                    => @2
+                }
+
+                @2 -> $0 {
+                    => @1
+                }
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_copy_propagation_result_is_legal() {
+        let input = r#"
+            fn init:
+                entry {
+                    stop
+                }
+            fn test:
+                entry x {
+                    => x ? @left : @right
+                }
+                left -> x {
+                    => @middle
+                }
+                right -> x {
+                    => @middle
+                }
+                middle y -> y {
+                    => @next
+                }
+                next z {
+                    w = add z z
+                    stop
+                }
+        "#;
+
+        let mut program = parse_or_panic(input, EmitConfig::init_only());
+        let store = AnalysesStore::default();
+        run_pass(&mut CopyPropagation::default(), &mut program, &store);
+
+        assert_eq!(Legalizer::default().run(&program, &store), Ok(()));
     }
 }
