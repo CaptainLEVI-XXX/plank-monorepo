@@ -1,9 +1,9 @@
 use hashbrown::HashMap;
 use plank_core::LoopLimit;
 
-use crate::analyses::{AnalysesMask, ControlFlowGraphInOutBundling, Dominators, InOutGroupId};
+use crate::analyses::{AnalysesMask, ControlFlowGraphInOutBundling, InOutGroupId};
 use sir_data::{
-    BasicBlockId, Control, EthIRProgram, Idx, IndexVec, LocalId, LocalIdx, Operation, Span,
+    BasicBlockId, Control, EthIRProgram, IndexVec, LocalId, LocalIdx, Operation, Span,
     operation::InlineOperands,
 };
 
@@ -12,27 +12,25 @@ use crate::{AnalysesStore, Pass};
 #[derive(Default)]
 pub struct CopyPropagation {
     copy_map: HashMap<LocalId, LocalId>,
-    raw_map: HashMap<LocalId, LocalId>,
-    canonical_map: HashMap<LocalId, LocalId>,
     io_groups: IndexVec<InOutGroupId, InOutGroupBlocks>,
-    def_blocks: IndexVec<LocalId, Option<BasicBlockId>>,
     function_entries: IndexVec<BasicBlockId, bool>,
-    slots_to_remove: IndexVec<InOutGroupId, Vec<bool>>,
-    candidates: Vec<RemovalCandidate>,
-    inserted_inputs: Vec<LocalId>,
-    seen_locals: Vec<LocalId>,
 }
 
 impl Pass for CopyPropagation {
     fn run(&mut self, program: &mut EthIRProgram, store: &AnalysesStore) {
+        self.build_function_entries(program);
+        self.build_in_out_groups(program, store);
+
         let mut limit = LoopLimit::new();
         loop {
             limit.tick();
             self.propagate_operation_copies(program);
-            if !self.propagate_input_output_copies(program, store) {
+            if !self.propagate_input_output_copies(program) {
                 break;
             }
         }
+
+        debug_assert_eq!(crate::Legalizer::default().run(program, store), Ok(()));
     }
 
     fn preserves(&self) -> AnalysesMask {
@@ -74,19 +72,28 @@ impl CopyPropagation {
         }
     }
 
-    fn propagate_input_output_copies(
-        &mut self,
-        program: &mut EthIRProgram,
-        store: &AnalysesStore,
-    ) -> bool {
-        self.build_def_blocks(program);
-        self.build_function_entries(program);
-        self.build_in_out_groups(program, store);
-        let dominators = store.dominators(program);
+    fn propagate_input_output_copies(&mut self, program: &mut EthIRProgram) -> bool {
+        let Some(candidate) = self.find_removable_input_output_slot(program) else {
+            return false;
+        };
 
-        self.raw_map.clear();
-        self.candidates.clear();
+        self.copy_map.clear();
+        add_slot_replacements(
+            program,
+            &self.io_groups[candidate.group],
+            candidate.slot,
+            candidate.replacement,
+            &mut self.copy_map,
+        );
+        debug_assert!(!self.copy_map.is_empty());
 
+        replace_uses(program, &self.copy_map);
+        compact_input_output_slot(program, &self.io_groups[candidate.group], candidate.slot);
+
+        true
+    }
+
+    fn find_removable_input_output_slot(&self, program: &EthIRProgram) -> Option<RemovalCandidate> {
         for group_id in self.io_groups.iter_idx() {
             let group = &self.io_groups[group_id];
             if group.inputs.is_empty() || group.outputs.is_empty() {
@@ -98,108 +105,35 @@ impl CopyPropagation {
             }
 
             let slots = program.basic_blocks[group.outputs[0]].outputs.len() as usize;
-            if !group_has_matching_arity(program, group, slots) {
-                continue;
-            }
+            debug_assert!(
+                group
+                    .outputs
+                    .iter()
+                    .all(|&bb_id| program.basic_blocks[bb_id].outputs.len() as usize == slots)
+            );
+            debug_assert!(
+                group
+                    .inputs
+                    .iter()
+                    .all(|&bb_id| program.basic_blocks[bb_id].inputs.len() as usize == slots)
+            );
 
             for slot in 0..slots {
                 let Some(replacement) = common_output_at_slot(program, group, slot) else {
                     continue;
                 };
 
-                if !self.replacement_is_available_at_inputs(&dominators, replacement, group) {
+                if !group.inputs.iter().any(|&bb_id| {
+                    local_at_slot(program, program.basic_blocks[bb_id].inputs, slot) != replacement
+                }) {
                     continue;
                 }
 
-                let Some(input_locals) = try_add_slot_replacements(
-                    program,
-                    group,
-                    slot,
-                    replacement,
-                    &mut self.raw_map,
-                    &mut self.inserted_inputs,
-                ) else {
-                    continue;
-                };
-
-                if input_locals {
-                    self.candidates.push(RemovalCandidate { group: group_id, slot, replacement });
-                }
+                return Some(RemovalCandidate { group: group_id, slot, replacement });
             }
         }
 
-        if self.raw_map.is_empty() {
-            return false;
-        }
-
-        self.canonicalize_raw_map();
-        if self.canonical_map.is_empty() {
-            return false;
-        }
-
-        self.copy_map.clear();
-        if self.slots_to_remove.len() < self.io_groups.len() {
-            self.slots_to_remove.resize_with(self.io_groups.len(), Vec::new);
-        }
-        for remove in self.slots_to_remove.iter_mut() {
-            remove.clear();
-        }
-
-        let mut changed = false;
-        for candidate_idx in 0..self.candidates.len() {
-            let candidate = self.candidates[candidate_idx];
-            let Some(replacement) =
-                self.candidate_final_replacement(program, &dominators, candidate)
-            else {
-                continue;
-            };
-
-            insert_candidate_replacements(
-                program,
-                &self.io_groups[candidate.group],
-                candidate,
-                replacement,
-                &mut self.copy_map,
-            );
-
-            let group = &self.io_groups[candidate.group];
-            let slots = program.basic_blocks[group.outputs[0]].outputs.len() as usize;
-            let remove = &mut self.slots_to_remove[candidate.group];
-            if remove.len() != slots {
-                remove.clear();
-                remove.resize(slots, false);
-            }
-            remove[candidate.slot] = true;
-            changed = true;
-        }
-
-        if !changed || self.copy_map.is_empty() {
-            return false;
-        }
-
-        replace_uses(program, &self.copy_map);
-        self.compact_removed_slots(program);
-
-        true
-    }
-
-    fn build_def_blocks(&mut self, program: &EthIRProgram) {
-        self.def_blocks.clear();
-        self.def_blocks.resize(program.next_free_local_id.idx(), None);
-
-        for bb_id in program.basic_blocks.iter_idx() {
-            let bb = &program.basic_blocks[bb_id];
-            for &local in &program.locals[bb.inputs] {
-                let prev = self.def_blocks[local].replace(bb_id);
-                debug_assert!(prev.is_none(), "SSA violation: {local:?} defined twice");
-            }
-            for op_idx in bb.operations.iter() {
-                for &local in program.operations[op_idx].outputs(program) {
-                    let prev = self.def_blocks[local].replace(bb_id);
-                    debug_assert!(prev.is_none(), "SSA violation: {local:?} defined twice");
-                }
-            }
-        }
+        None
     }
 
     fn build_function_entries(&mut self, program: &EthIRProgram) {
@@ -235,87 +169,6 @@ impl CopyPropagation {
     fn group_mut(&mut self, group: InOutGroupId) -> &mut InOutGroupBlocks {
         &mut self.io_groups[group]
     }
-
-    fn replacement_is_available_at_inputs(
-        &self,
-        dominators: &Dominators,
-        replacement: LocalId,
-        group: &InOutGroupBlocks,
-    ) -> bool {
-        let Some(Some(def_bb)) = self.def_blocks.get(replacement).copied() else {
-            return false;
-        };
-
-        group.inputs.iter().all(|&input_bb| strictly_dominates(dominators, def_bb, input_bb))
-    }
-
-    fn candidate_final_replacement(
-        &self,
-        program: &EthIRProgram,
-        dominators: &Dominators,
-        candidate: RemovalCandidate,
-    ) -> Option<LocalId> {
-        let group = &self.io_groups[candidate.group];
-        let mut final_replacement = None;
-
-        for &bb_id in &group.inputs {
-            let input = local_at_slot(program, program.basic_blocks[bb_id].inputs, candidate.slot);
-            if input == candidate.replacement {
-                continue;
-            }
-
-            let &replacement = self.canonical_map.get(&input)?;
-            match final_replacement {
-                None => final_replacement = Some(replacement),
-                Some(existing) if existing == replacement => {}
-                Some(_) => return None,
-            }
-        }
-
-        let replacement = final_replacement?;
-        self.replacement_is_available_at_inputs(dominators, replacement, group)
-            .then_some(replacement)
-    }
-
-    fn canonicalize_raw_map(&mut self) {
-        self.canonical_map.clear();
-
-        let raw_map = &self.raw_map;
-        let canonical_map = &mut self.canonical_map;
-        let seen_locals = &mut self.seen_locals;
-
-        for &key in raw_map.keys() {
-            let Some(resolved) = resolve_copy_target_from_snapshot(key, raw_map, seen_locals)
-            else {
-                continue;
-            };
-
-            if resolved != key {
-                canonical_map.insert(key, resolved);
-            }
-        }
-    }
-
-    fn compact_removed_slots(&mut self, program: &mut EthIRProgram) {
-        for group_id in self.io_groups.iter_idx() {
-            let group = &self.io_groups[group_id];
-            let remove = &self.slots_to_remove[group_id];
-            if !remove.iter().any(|&remove| remove) {
-                continue;
-            }
-
-            for &bb_id in &group.inputs {
-                let inputs = program.basic_blocks[bb_id].inputs;
-                program.basic_blocks[bb_id].inputs =
-                    compact_span(&mut program.locals, inputs, remove);
-            }
-            for &bb_id in &group.outputs {
-                let outputs = program.basic_blocks[bb_id].outputs;
-                program.basic_blocks[bb_id].outputs =
-                    compact_span(&mut program.locals, outputs, remove);
-            }
-        }
-    }
 }
 
 fn replace_if_copied(input: &mut LocalId, copy_map: &HashMap<LocalId, LocalId>) {
@@ -344,42 +197,6 @@ struct RemovalCandidate {
     replacement: LocalId,
 }
 
-fn strictly_dominates(
-    dominators: &Dominators,
-    dominator: BasicBlockId,
-    mut block: BasicBlockId,
-) -> bool {
-    if dominator == block {
-        return false;
-    }
-
-    let mut limit = LoopLimit::new();
-    while let Some(idom) = dominators.of(block) {
-        limit.tick();
-        if idom == dominator {
-            return true;
-        }
-        if idom == block {
-            return false;
-        }
-        block = idom;
-    }
-
-    false
-}
-
-fn group_has_matching_arity(
-    program: &EthIRProgram,
-    group: &InOutGroupBlocks,
-    slots: usize,
-) -> bool {
-    group.outputs.iter().all(|&bb_id| program.basic_blocks[bb_id].outputs.len() as usize == slots)
-        && group
-            .inputs
-            .iter()
-            .all(|&bb_id| program.basic_blocks[bb_id].inputs.len() as usize == slots)
-}
-
 fn common_output_at_slot(
     program: &EthIRProgram,
     group: &InOutGroupBlocks,
@@ -398,82 +215,32 @@ fn local_at_slot(program: &EthIRProgram, span: Span<LocalIdx>, slot: usize) -> L
     program.locals[span.start + slot as u32]
 }
 
-fn try_add_slot_replacements(
+fn add_slot_replacements(
     program: &EthIRProgram,
     group: &InOutGroupBlocks,
     slot: usize,
     replacement: LocalId,
-    raw_map: &mut HashMap<LocalId, LocalId>,
-    inserted: &mut Vec<LocalId>,
-) -> Option<bool> {
-    inserted.clear();
-    let mut has_replacements = false;
-
+    copy_map: &mut HashMap<LocalId, LocalId>,
+) {
     for &bb_id in &group.inputs {
         let input = local_at_slot(program, program.basic_blocks[bb_id].inputs, slot);
         if input == replacement {
             continue;
         }
 
-        has_replacements = true;
-        match raw_map.get(&input).copied() {
-            None => {
-                raw_map.insert(input, replacement);
-                inserted.push(input);
-            }
-            Some(existing) if existing == replacement => {}
-            Some(_) => {
-                for &input in inserted.iter() {
-                    raw_map.remove(&input);
-                }
-                return None;
-            }
-        }
-    }
-
-    Some(has_replacements)
-}
-
-fn resolve_copy_target_from_snapshot(
-    local: LocalId,
-    snapshot: &HashMap<LocalId, LocalId>,
-    seen: &mut Vec<LocalId>,
-) -> Option<LocalId> {
-    seen.clear();
-    let mut current = local;
-
-    let mut limit = LoopLimit::new();
-    while let Some(&next) = snapshot.get(&current) {
-        limit.tick();
-        if seen.contains(&current) {
-            return None;
-        }
-
-        seen.push(current);
-        current = next;
-    }
-
-    Some(current)
-}
-
-fn insert_candidate_replacements(
-    program: &EthIRProgram,
-    group: &InOutGroupBlocks,
-    candidate: RemovalCandidate,
-    replacement: LocalId,
-    copy_map: &mut HashMap<LocalId, LocalId>,
-) {
-    for &bb_id in &group.inputs {
-        let input = local_at_slot(program, program.basic_blocks[bb_id].inputs, candidate.slot);
-        if input == candidate.replacement {
-            continue;
-        }
-
         let prev = copy_map.insert(input, replacement);
-        debug_assert!(
-            prev.is_none_or(|prev| prev == replacement),
-            "conflicting replacement for ${input}"
-        );
+        debug_assert!(prev.is_none(), "SSA violation: ${input} used as two block inputs");
+    }
+}
+
+fn compact_input_output_slot(program: &mut EthIRProgram, group: &InOutGroupBlocks, slot: usize) {
+    for &bb_id in &group.inputs {
+        let inputs = program.basic_blocks[bb_id].inputs;
+        program.basic_blocks[bb_id].inputs = compact_span_slot(&mut program.locals, inputs, slot);
+    }
+    for &bb_id in &group.outputs {
+        let outputs = program.basic_blocks[bb_id].outputs;
+        program.basic_blocks[bb_id].outputs = compact_span_slot(&mut program.locals, outputs, slot);
     }
 }
 
@@ -508,16 +275,16 @@ fn replace_control_uses(control: &mut Control, copy_map: &HashMap<LocalId, Local
     }
 }
 
-fn compact_span(
+fn compact_span_slot(
     locals: &mut IndexVec<LocalIdx, LocalId>,
     span: Span<LocalIdx>,
-    remove: &[bool],
+    remove_slot: usize,
 ) -> Span<LocalIdx> {
-    debug_assert_eq!(span.len() as usize, remove.len());
+    debug_assert!(remove_slot < span.len() as usize);
 
     let mut write = span.start;
     for (slot, read) in span.iter().enumerate() {
-        if remove[slot] {
+        if slot == remove_slot {
             continue;
         }
         locals[write] = locals[read];
@@ -530,9 +297,17 @@ fn compact_span(
 #[cfg(test)]
 mod tests {
     use super::CopyPropagation;
-    use crate::{AnalysesStore, Legalizer, run_pass, run_pass_and_display};
-    use sir_data::assert_ir_display;
+    use crate::{AnalysesStore, Legalizer, run_pass};
+    use sir_data::{EthIRProgram, assert_ir_display};
     use sir_parser::{EmitConfig, parse_or_panic};
+
+    fn run_copy_propagation_and_display(source: &str) -> EthIRProgram {
+        let mut program = parse_or_panic(source, EmitConfig::init_only());
+        let store = AnalysesStore::default();
+        run_pass(&mut CopyPropagation::default(), &mut program, &store);
+        assert_eq!(Legalizer::default().run(&program, &store), Ok(()));
+        program
+    }
 
     #[test]
     fn test_copy_chains_and_inline_operands() {
@@ -552,7 +327,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -597,7 +372,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -645,7 +420,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -698,7 +473,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -752,7 +527,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -799,7 +574,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -846,7 +621,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -897,7 +672,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -951,7 +726,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -1010,7 +785,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -1076,7 +851,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -1134,7 +909,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -1170,7 +945,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -1207,7 +982,7 @@ mod tests {
                 }
         "#;
 
-        let actual = run_pass_and_display::<CopyPropagation>(input);
+        let actual = run_copy_propagation_and_display(input);
         assert_ir_display(
             &actual,
             r#"
@@ -1230,38 +1005,5 @@ mod tests {
                 }
             "#,
         );
-    }
-
-    #[test]
-    fn test_copy_propagation_result_is_legal() {
-        let input = r#"
-            fn init:
-                entry {
-                    stop
-                }
-            fn test:
-                entry x {
-                    => x ? @left : @right
-                }
-                left -> x {
-                    => @middle
-                }
-                right -> x {
-                    => @middle
-                }
-                middle y -> y {
-                    => @next
-                }
-                next z {
-                    w = add z z
-                    stop
-                }
-        "#;
-
-        let mut program = parse_or_panic(input, EmitConfig::init_only());
-        let store = AnalysesStore::default();
-        run_pass(&mut CopyPropagation::default(), &mut program, &store);
-
-        assert_eq!(Legalizer::default().run(&program, &store), Ok(()));
     }
 }
